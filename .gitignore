@@ -1,0 +1,87 @@
+# =========================
+# CONFIG
+# =========================
+.env
+.env.*
+*.env
+*.key
+*.pem
+secrets.json
+config.json
+
+# =========================
+# PYTHON
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+venv/
+env/
+ENV/
+.venv/
+
+# Archivos de distribución
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+
+# =========================
+# DEPENDENCIAS
+# =========================
+pip-wheel-metadata/
+
+# =========================
+# TEST / COVERAGE
+# =========================
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+
+# =========================
+# IDEs / EDITORES
+# =========================
+# VSCode
+.vscode/
+
+# IntelliJ / PyCharm
+.idea/
+*.iml
+
+# =========================
+# SISTEMA OPERATIVO
+# =========================
+# Windows
+Thumbs.db
+desktop.ini
+
+# Mac
+.DS_Store
+
+# =========================
+# AWS / AZURE
+# =========================
+.aws/
+.azure/
+
+# =========================
+# DOCKER
+# =========================
+docker-compose.override.yml
+
+# =========================
+# JUPYTER
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OTROS
+# =========================
+*.sqlite3
+*.db

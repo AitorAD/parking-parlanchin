@@ -1,5 +1,6 @@
 from __future__ import annotations
 import configparser
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -87,6 +88,30 @@ def normalizar_texto(texto: str) -> str:
 def limpiar_texto_matricula(texto: str) -> str:
     return texto.upper().replace(" ", "").replace("-", "")
 
+def calcular_aspect_ratio(geometry: dict[str, Any]) -> float:
+    polygon = geometry.get("Polygon", [])
+    if len(polygon) >= 4:
+        points = [
+            (float(point.get("X", 0)), float(point.get("Y", 0)))
+            for point in polygon[:4]
+        ]
+        edges = [
+            math.dist(points[index], points[(index + 1) % 4])
+            for index in range(4)
+        ]
+        short_edges = sorted(edges)[:2]
+        long_edges = sorted(edges)[-2:]
+        avg_short_edge = sum(short_edges) / len(short_edges)
+        avg_long_edge = sum(long_edges) / len(long_edges)
+
+        if avg_short_edge:
+            return avg_long_edge / avg_short_edge
+
+    box = geometry.get("BoundingBox", {})
+    width = float(box.get("Width", 0))
+    height = float(box.get("Height", 0))
+    return width / height if height else 0
+
 # Funcion para verificar si un texto tiene el formato de una matricula valida, considerando longitud, caracteres y proporcion
 def tiene_formato_matricula(texto: str, aspect_ratio: float) -> bool:
     if not MIN_PLATE_LENGTH <= len(texto) <= MAX_PLATE_LENGTH:
@@ -128,11 +153,12 @@ def detectar_textos(image_bytes: bytes) -> list[TextDetection]:
             continue
 
         text = limpiar_texto_matricula(item.get("DetectedText", ""))
-        box = item.get("Geometry", {}).get("BoundingBox", {})
+        geometry = item.get("Geometry", {})
+        box = geometry.get("BoundingBox", {})
         width = float(box.get("Width", 0))
         height = float(box.get("Height", 0))
         area = width * height
-        aspect_ratio = width / height if height else 0
+        aspect_ratio = calcular_aspect_ratio(geometry)
 
         if text:
             detections.append(

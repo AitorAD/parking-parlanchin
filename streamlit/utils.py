@@ -25,12 +25,19 @@ POLLY_VOICES = (
 # Expresiones regulares para detectar formatos comunes de matriculas españolas.
 PLATE_PATTERNS = (
     re.compile(r"\b\d{4}[BCDFGHJKLMNPRSTVWXYZ]{3}\b"),
+    re.compile(r"\b[A-Z]{1,3}[A-Z]{1,2}\d{1,4}\b"),
+    re.compile(r"\b[A-Z]{2}\d{3}[A-Z]{2}\b"),
     re.compile(r"\b[A-Z]{1,3}\d{3,4}[A-Z]{0,3}\b"),
 )
 MIN_PLATE_LENGTH = 5
 MAX_PLATE_LENGTH = 9
 MIN_PLATE_ASPECT_RATIO = 2.0
 MAX_PLATE_ASPECT_RATIO = 12.0
+MAX_WORD_ANGLE_DIFF = 12.0
+MAX_WORD_HEIGHT_DIFF_RATIO = 0.6
+MAX_WORD_GAP_FACTOR = 4.5
+MAX_WORD_VERTICAL_FACTOR = 1.4
+PARTIAL_PLATE_CONFIDENCE_MARGIN = 5.0
 
 # Las clases de datos representan las detecciones de texto y los eventos de parking.
 # Class TextDetection representa un texto detectado en la imagen, con su confianza y características geométricas.
@@ -40,6 +47,22 @@ class TextDetection:
     confidence: float
     area: float = 0
     aspect_ratio: float = 0
+
+@dataclass(frozen=True)
+class TextPart:
+    text: str
+    confidence: float
+    area: float
+    aspect_ratio: float
+    left: float
+    top: float
+    width: float
+    height: float
+    center_x: float
+    center_y: float
+    angle: float
+    axis_length: float
+    cross_length: float
 
 # Class ParkingEvent representa un evento de entrada o salida en el parking,
 # con detalles sobre la matricula, tipo de evento, fecha y hora, y si el vehículo estaba dentro del parking.
@@ -88,13 +111,26 @@ def normalizar_texto(texto: str) -> str:
 def limpiar_texto_matricula(texto: str) -> str:
     return texto.upper().replace(" ", "").replace("-", "")
 
+def normalizar_angulo(angle: float) -> float:
+    while angle <= -90:
+        angle += 180
+    while angle > 90:
+        angle -= 180
+    return angle
+
+def diferencia_angulo(first: float, second: float) -> float:
+    diff = abs(first - second) % 180
+    return min(diff, 180 - diff)
+
+def puntos_poligono(geometry: dict[str, Any]) -> list[tuple[float, float]]:
+    return [
+        (float(point.get("X", 0)), float(point.get("Y", 0)))
+        for point in geometry.get("Polygon", [])[:4]
+    ]
+
 def calcular_aspect_ratio(geometry: dict[str, Any]) -> float:
-    polygon = geometry.get("Polygon", [])
-    if len(polygon) >= 4:
-        points = [
-            (float(point.get("X", 0)), float(point.get("Y", 0)))
-            for point in polygon[:4]
-        ]
+    points = puntos_poligono(geometry)
+    if len(points) >= 4:
         edges = [
             math.dist(points[index], points[(index + 1) % 4])
             for index in range(4)
@@ -111,6 +147,53 @@ def calcular_aspect_ratio(geometry: dict[str, Any]) -> float:
     width = float(box.get("Width", 0))
     height = float(box.get("Height", 0))
     return width / height if height else 0
+
+def extraer_parte_texto(item: dict[str, Any]) -> TextPart | None:
+    text = limpiar_texto_matricula(item.get("DetectedText", ""))
+    if not text:
+        return None
+
+    geometry = item.get("Geometry", {})
+    box = geometry.get("BoundingBox", {})
+    left = float(box.get("Left", 0))
+    top = float(box.get("Top", 0))
+    width = float(box.get("Width", 0))
+    height = float(box.get("Height", 0))
+    points = puntos_poligono(geometry)
+    center_x = left + (width / 2)
+    center_y = top + (height / 2)
+    angle = 0.0
+    axis_length = width
+    cross_length = height
+
+    if len(points) >= 4:
+        center_x = sum(point[0] for point in points) / len(points)
+        center_y = sum(point[1] for point in points) / len(points)
+        edges = [
+            math.dist(points[index], points[(index + 1) % 4])
+            for index in range(4)
+        ]
+        axis_length = sum(sorted(edges)[-2:]) / 2
+        cross_length = sum(sorted(edges)[:2]) / 2
+        angle = normalizar_angulo(
+            math.degrees(math.atan2(points[1][1] - points[0][1], points[1][0] - points[0][0]))
+        )
+
+    return TextPart(
+        text=text,
+        confidence=float(item.get("Confidence", 0)),
+        area=width * height,
+        aspect_ratio=calcular_aspect_ratio(geometry),
+        left=left,
+        top=top,
+        width=width,
+        height=height,
+        center_x=center_x,
+        center_y=center_y,
+        angle=angle,
+        axis_length=axis_length,
+        cross_length=cross_length,
+    )
 
 # Funcion para verificar si un texto tiene el formato de una matricula valida, considerando longitud, caracteres y proporcion
 def tiene_formato_matricula(texto: str, aspect_ratio: float) -> bool:
@@ -142,35 +225,141 @@ def extraer_matricula(texto: str, aspect_ratio: float = 0) -> str | None:
 
     return texto_limpio
 
+def proyectar_punto(part: TextPart, angle: float) -> tuple[float, float]:
+    radians = math.radians(angle)
+    axis_x = math.cos(radians)
+    axis_y = math.sin(radians)
+    cross_x = -axis_y
+    cross_y = axis_x
+    axis_position = (part.center_x * axis_x) + (part.center_y * axis_y)
+    cross_position = (part.center_x * cross_x) + (part.center_y * cross_y)
+    return axis_position, cross_position
+
+def crear_deteccion_agrupada(parts: list[TextPart]) -> TextDetection:
+    ordered_parts = sorted(parts, key=lambda part: proyectar_punto(part, parts[0].angle)[0])
+    angle = sum(part.angle for part in ordered_parts) / len(ordered_parts)
+    axis_spans = []
+    cross_lengths = []
+
+    for part in ordered_parts:
+        axis_position, _ = proyectar_punto(part, angle)
+        axis_spans.append((axis_position - (part.axis_length / 2), axis_position + (part.axis_length / 2)))
+        cross_lengths.append(part.cross_length or part.height)
+
+    axis_length = max(end for _, end in axis_spans) - min(start for start, _ in axis_spans)
+    cross_length = sum(cross_lengths) / len(cross_lengths)
+    aspect_ratio = axis_length / cross_length if cross_length else 0
+    confidence = sum(part.confidence for part in ordered_parts) / len(ordered_parts)
+
+    return TextDetection(
+        text="".join(part.text for part in ordered_parts),
+        confidence=confidence,
+        area=axis_length * cross_length,
+        aspect_ratio=aspect_ratio,
+    )
+
+def es_candidato_palabra(part: TextPart) -> bool:
+    return len(part.text) > 1 or any(char.isdigit() for char in part.text)
+
+def estan_en_la_misma_linea(group: list[TextPart], candidate: TextPart) -> bool:
+    angle = sum(part.angle for part in group) / len(group)
+    avg_height = sum(part.cross_length or part.height for part in group) / len(group)
+    candidate_height = candidate.cross_length or candidate.height
+
+    if diferencia_angulo(angle, candidate.angle) > MAX_WORD_ANGLE_DIFF:
+        return False
+
+    height_diff_ratio = abs(candidate_height - avg_height) / avg_height if avg_height else 1
+    if height_diff_ratio > MAX_WORD_HEIGHT_DIFF_RATIO:
+        return False
+
+    group_cross_positions = [proyectar_punto(part, angle)[1] for part in group]
+    _, candidate_cross = proyectar_punto(candidate, angle)
+    vertical_distance = abs(candidate_cross - (sum(group_cross_positions) / len(group_cross_positions)))
+    if vertical_distance > avg_height * MAX_WORD_VERTICAL_FACTOR:
+        return False
+
+    ordered_group = sorted(group, key=lambda part: proyectar_punto(part, angle)[0])
+    last = ordered_group[-1]
+    last_axis = proyectar_punto(last, angle)[0]
+    candidate_axis = proyectar_punto(candidate, angle)[0]
+    gap = candidate_axis - (last_axis + (last.axis_length / 2))
+    max_gap = avg_height * MAX_WORD_GAP_FACTOR
+    return gap <= max_gap
+
+def agrupar_palabras_matricula(parts: list[TextPart]) -> list[TextDetection]:
+    words = sorted(
+        [part for part in parts if es_candidato_palabra(part)],
+        key=lambda part: (part.center_y, part.center_x),
+    )
+    grouped_detections: list[TextDetection] = []
+
+    for start_index, word in enumerate(words):
+        group = [word]
+        following_words = sorted(words[start_index + 1 :], key=lambda part: proyectar_punto(part, word.angle)[0])
+
+        for candidate in following_words:
+            if not estan_en_la_misma_linea(group, candidate):
+                continue
+
+            group.append(candidate)
+            if len(group) >= 2:
+                grouped_detections.append(crear_deteccion_agrupada(group))
+
+    return grouped_detections
+
+def es_subsecuencia(texto_corto: str, texto_largo: str) -> bool:
+    if len(texto_corto) >= len(texto_largo):
+        return False
+
+    iterator = iter(texto_largo)
+    return all(char in iterator for char in texto_corto)
+
+def es_matricula_parcial(detection: TextDetection, complete_detection: TextDetection) -> bool:
+    return (
+        es_subsecuencia(detection.text, complete_detection.text)
+        and complete_detection.confidence >= detection.confidence - PARTIAL_PLATE_CONFIDENCE_MARGIN
+    )
+
+def quitar_matriculas_parciales(detections: list[TextDetection]) -> list[TextDetection]:
+    filtered_detections: list[TextDetection] = []
+
+    for detection in detections:
+        is_partial_plate = any(
+            es_matricula_parcial(detection, complete_detection)
+            for complete_detection in detections
+            if complete_detection is not detection
+        )
+        if not is_partial_plate:
+            filtered_detections.append(detection)
+
+    return filtered_detections
+
 # Funcion para detectar textos en una imagen utilizando AWS Rekognition, filtrando por lineas y extrayendo caracteristicas relevantes
 def detectar_textos(image_bytes: bytes) -> list[TextDetection]:
     rekognition = crear_cliente("rekognition")
     response = rekognition.detect_text(Image={"Bytes": image_bytes})
 
     detections: list[TextDetection] = []
+    word_parts: list[TextPart] = []
     for item in response.get("TextDetections", []):
-        if item.get("Type") != "LINE":
+        text_part = extraer_parte_texto(item)
+        if not text_part:
             continue
 
-        text = limpiar_texto_matricula(item.get("DetectedText", ""))
-        geometry = item.get("Geometry", {})
-        box = geometry.get("BoundingBox", {})
-        width = float(box.get("Width", 0))
-        height = float(box.get("Height", 0))
-        area = width * height
-        aspect_ratio = calcular_aspect_ratio(geometry)
-
-        if text:
+        if item.get("Type") == "LINE":
             detections.append(
                 TextDetection(
-                    text=text,
-                    confidence=float(item.get("Confidence", 0)),
-                    area=area,
-                    aspect_ratio=aspect_ratio,
+                    text=text_part.text,
+                    confidence=text_part.confidence,
+                    area=text_part.area,
+                    aspect_ratio=text_part.aspect_ratio,
                 )
             )
+        elif item.get("Type") == "WORD":
+            word_parts.append(text_part)
 
-    return detections
+    return detections + agrupar_palabras_matricula(word_parts)
 
 # Funcion para detectar matriculas en una imagen, filtrando las detecciones de texto por formato de matricula y ordenando por area
 def detectar_matriculas(image_bytes: bytes) -> list[TextDetection]:
@@ -191,7 +380,13 @@ def detectar_matriculas(image_bytes: bytes) -> list[TextDetection]:
                 aspect_ratio=detection.aspect_ratio,
             )
 
-    return sorted(plates.values(), key=lambda detection: detection.area, reverse=True)
+    filtered_plates = quitar_matriculas_parciales(list(plates.values()))
+
+    return sorted(
+        filtered_plates,
+        key=lambda detection: (detection.confidence, detection.area, len(detection.text)),
+        reverse=True,
+    )
 
 # funcion para crear la tabla de DynamoDB si no existe, definiendo su esquema y esperando a que esté disponible antes de continuar
 def crear_tabla_si_no_existe() -> None:
